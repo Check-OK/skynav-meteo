@@ -1,0 +1,38 @@
+# Tâche planifiée GitHub : toutes les 3 heures, le dernier réseau AROME est
+# converti en images et envoyé sur Cloudflare R2.
+#
+# Secrets à renseigner dans le dépôt (Settings → Secrets → Actions) :
+#   R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET
+name: Météo AROME
+
+on:
+  schedule:
+    # Réseaux AROME à 0 h, 3 h, 6 h… UTC, publiés environ 2 h 30 après.
+    - cron: '40 2,5,8,11,14,17,20,23 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: meteo
+  cancel-in-progress: false
+
+jobs:
+  arome:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - run: pip install -r requirements.txt
+      - name: Conversion
+        run: python build_meteo.py --out out/arome --hours 30 --cache /tmp/grib
+      - name: Envoi sur R2
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: python upload_r2.py out/arome/*/
