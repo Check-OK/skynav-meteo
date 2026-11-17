@@ -6,6 +6,8 @@ que l'appli télécharge à la demande et dessine sur sa carte :
 - ``sfc`` : vent à 10 m (est, nord) et rafales ;
 - ``wx``  : pluie, nuages, température à 2 m ;
 - ``cv``  : instabilité (CAPE), base des cumulus, humidité ;
+- ``cl``  : bas et haut de la première couche de nuages (humidité ≥ 95 %
+  aux hauteurs du modèle), plafond des thermiques (couche limite) ;
 - ``hNNNN`` : vent à NNNN m au-dessus du sol (est, nord).
 
 Chaque canal est un octet : valeur = min + octet / 255 × (max − min),
@@ -52,7 +54,14 @@ LAYERS = {
            ('temp', -40, 50, False)],
     'cv': [('cape', 0, 4000, True), ('cloudBase', 0, 5000, False),
            ('humidity', 0, 100, False)],
+    # 4 000 m : pas de nuage (ou sommet) sous 3 000 m.
+    'cl': [('cloudLow', 0, 4000, False), ('cloudTop', 0, 4000, False),
+           ('thermalTop', 0, 4000, False)],
 }
+
+# Humidité au-delà de laquelle on considère qu'on est dans le nuage.
+CLOUD_RH = 95.0
+NO_CLOUD = 4000.0
 for _lv in LEVELS:
     LAYERS[f'h{_lv}'] = [('u', -150, 150, False), ('v', -150, 150, False),
                          ('speed', 0, 200, False)]
@@ -180,6 +189,42 @@ def total_clouds(l, m, h):
     return 100 * (1 - (1 - f(l)) * (1 - f(m)) * (1 - f(h)))
 
 
+def cloud_layer(rh_by_height: dict) -> tuple[np.ndarray, np.ndarray]:
+    """Bas et haut (m sol) de la première couche nuageuse sous 3 000 m.
+
+    [rh_by_height] : hauteur → humidité (%). Les passages du seuil sont
+    interpolés entre deux hauteurs. Pas de nuage : bas = haut = 4 000 ;
+    nuage jusqu'en haut de la colonne : haut = 4 000.
+    """
+    hs = sorted(rh_by_height)
+    r = np.stack([np.nan_to_num(rh_by_height[h], nan=0) for h in hs])
+    z = np.array(hs, dtype=np.float32)[:, None, None]
+    wet = r >= CLOUD_RH
+    shape = r.shape[1:]
+    base = np.full(shape, NO_CLOUD, np.float32)
+    top = np.full(shape, NO_CLOUD, np.float32)
+    found = np.zeros(shape, bool)
+    ended = np.zeros(shape, bool)
+    for k in range(len(hs)):
+        start = wet[k] & ~found
+        if k == 0:
+            base[start] = z[0, 0, 0]
+        else:
+            f = np.clip((CLOUD_RH - r[k - 1]) / np.maximum(r[k] - r[k - 1], 1e-3),
+                        0, 1)
+            zb = z[k - 1, 0, 0] + f * (z[k, 0, 0] - z[k - 1, 0, 0])
+            base[start] = zb[start]
+        found |= start
+        stop = found & ~ended & ~wet[k]
+        if k > 0:
+            f = np.clip((r[k - 1] - CLOUD_RH) / np.maximum(r[k - 1] - r[k], 1e-3),
+                        0, 1)
+            zt = z[k - 1, 0, 0] + f * (z[k, 0, 0] - z[k - 1, 0, 0])
+            top[stop] = zt[stop]
+        ended |= stop
+    return base, top
+
+
 def build(run: str, hours: int, out: Path, cache: Path):
     out.mkdir(parents=True, exist_ok=True)
     cache.mkdir(parents=True, exist_ok=True)
@@ -188,11 +233,12 @@ def build(run: str, hours: int, out: Path, cache: Path):
     sfc_wanted = {'10u': None, '10v': None, 'max_i10fg': None, 'tp': None,
                   '2t': None, '2r': None}
     sp2_wanted = {'2d': None, 'lcc': None, 'mcc': None, 'hcc': None,
-                  'CAPE_INS': None}
+                  'CAPE_INS': None, 'blh': None}
     # À 100 m, Météo-France range le vent sous « 100u » / « 100v ».
     hp_wanted = {'u': set(LEVELS), 'v': set(LEVELS), '100u': None,
-                 '100v': None}
+                 '100v': None, 'r': None}
     made_levels = set()
+    made_cl = False
     prev_tp = None
     done_hours = []
     geo = None
@@ -241,6 +287,15 @@ def build(run: str, hours: int, out: Path, cache: Path):
             save_layer(out, 'wx', s, [rain, clouds, temp])
             save_layer(out, 'cv', s, [cape, base,
                                       rh if rh is not None else np.zeros_like(u)])
+            rh_h = {l: v for (k, l, t), v in c.items() if k == 'r' and t == s}
+            if rh_h:
+                low, top = cloud_layer(rh_h)
+                blh = g(b, 'blh')
+                save_layer(out, 'cl', s, [
+                    low, top,
+                    np.clip(np.nan_to_num(blh), 0, 4000) if blh is not None
+                    else np.zeros_like(u)])
+                made_cl = True
             for lv in LEVELS:
                 hu, hv = g(c, 'u', lv), g(c, 'v', lv)
                 if hu is None or hv is None:
@@ -268,7 +323,8 @@ def build(run: str, hours: int, out: Path, cache: Path):
         **geo,
         'layers': {k: [{'name': n, 'min': lo, 'max': hi, 'sqrt': root}
                        for n, lo, hi, root in v] for k, v in LAYERS.items()
-                   if not k.startswith('h') or int(k[1:]) in made_levels},
+                   if (not k.startswith('h') or int(k[1:]) in made_levels)
+                   and (k != 'cl' or made_cl)},
     }
     (out / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False))
     print('Fini :', len(done_hours), 'heures')
